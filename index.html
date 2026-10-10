@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>手機 YOLO 即時辨識</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif}*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#ecf3ff}main{max-width:900px;margin:auto;padding:14px}h1{font-size:1.3rem;margin:5px 0 10px}.viewer{position:relative;width:100%;aspect-ratio:3/4;background:#050914;border-radius:14px;overflow:hidden}video,canvas#overlay{position:absolute;width:100%;height:100%;inset:0;object-fit:contain}video{transform:scaleX(1)}canvas#overlay{pointer-events:none}.tools{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}button{border:0;border-radius:10px;background:#3977f6;color:white;padding:12px 16px;font-size:1rem;font-weight:600;cursor:pointer}button.secondary{background:#293449}button:disabled{opacity:.5;cursor:wait}label{display:flex;align-items:center;gap:8px}input[type=range]{width:140px}#status{min-height:2.5em;color:#b9c9e4;font-size:.92rem}small{display:block;color:#8498b9;line-height:1.5}#stats{font-variant-numeric:tabular-nums;color:#9fefbc;margin:8px 0}
+</style>
+</head>
+<body><main>
+<h1>YOLO 手機即時物件辨識</h1>
+<div class="viewer" id="viewer"><video id="video" autoplay muted playsinline></video><canvas id="overlay"></canvas></div>
+<div class="tools"><button id="start">啟動鏡頭</button><button class="secondary" id="flip">切換前／後鏡頭</button><button class="secondary" id="stop">停止</button></div>
+<div class="tools"><label>信心門檻 <input type="range" id="confidence" min="10" max="90" value="35"><span id="threshold">35%</span></label></div>
+<div id="stats">等待啟動</div><div id="status" role="status">載入模型中…</div><small>首次開啟需下載 best.onnx；請使用 HTTPS（GitHub Pages 支援）並允許相機存取。辨識在本機瀏覽器執行，不會上傳相機影像。</small>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),video=$('video'),canvas=$('overlay'),ctx=canvas.getContext('2d');
+const inputCanvas=document.createElement('canvas'),inputCtx=inputCanvas.getContext('2d',{willReadFrequently:true});
+let session=null,stream=null,running=false,busy=false,mirror=false,facing='environment',classes=[],frameCount=0,lastStat=performance.now();
+let inputW=640,inputH=640;
+function status(msg){$('status').textContent=msg;}
+function setButtons(){ $('start').disabled=!session||running; $('flip').disabled=!session; $('stop').disabled=!running; }
+function color(k){return `hsl(${(k*53+185)%360} 90% 65%)`;}
+async function loadModel(){
+ try{
+  ort.env.wasm.wasmPaths='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  ort.env.wasm.numThreads=1;
+  session=await ort.InferenceSession.create('./best.onnx',{executionProviders:['wasm'],graphOptimizationLevel:'all'});
+  const input=session.inputNames[0];
+  const dims=session.inputMetadata?.[input]?.dimensions;
+  if(dims?.length===4){inputH=Number(dims[2])||640;inputW=Number(dims[3])||640;}
+  inputCanvas.width=inputW;inputCanvas.height=inputH;
+  try{const r=await fetch('./classes.json');if(r.ok){const j=await r.json();classes=Array.isArray(j)?j:Object.values(j);}}catch{}
+  status(`模型已載入 (${inputW}×${inputH})，請按「啟動鏡頭」。`);
+ }catch(e){console.error(e);status('模型載入失敗：請確認 best.onnx 在同一目錄且由 HTTPS 網頁開啟。錯誤：'+e.message);}
+ setButtons();
+}
+function resizeOverlay(){const w=video.videoWidth,h=video.videoHeight;if(!w||!h)return;canvas.width=w;canvas.height=h;$('viewer').style.aspectRatio=`${w}/${h}`;}
+async function stopCamera(){running=false;if(stream){for(const track of stream.getTracks())track.stop();stream=null;}video.srcObject=null;ctx.clearRect(0,0,canvas.width,canvas.height);$('stats').textContent='已停止';setButtons();}
+async function startCamera(){
+ if(!session)return;
+ await stopCamera();
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}}});
+  video.srcObject=stream;await video.play();mirror=facing==='user';
+  video.style.transform=mirror?'scaleX(-1)':'none';resizeOverlay();running=true;frameCount=0;lastStat=performance.now();setButtons();status(`正在使用${mirror?'前':'後'}鏡頭辨識`);requestAnimationFrame(loop);
+ }catch(e){console.error(e);status('無法啟用相機：'+e.message+'。請允許相機權限，並確認網站使用 HTTPS。');setButtons();}
+}
+function preprocess(){
+ // 與 Ultralytics letterbox 對齊：保留比例、以 114 灰色補邊。
+ const vw=video.videoWidth,vh=video.videoHeight,scale=Math.min(inputW/vw,inputH/vh),dw=Math.round(vw*scale),dh=Math.round(vh*scale);
+ const dx=Math.floor((inputW-dw)/2),dy=Math.floor((inputH-dh)/2);
+ inputCtx.fillStyle='rgb(114,114,114)';inputCtx.fillRect(0,0,inputW,inputH);inputCtx.drawImage(video,0,0,vw,vh,dx,dy,dw,dh);
+ const rgba=inputCtx.getImageData(0,0,inputW,inputH).data,area=inputW*inputH,data=new Float32Array(area*3);
+ for(let i=0,j=0;i<rgba.length;i+=4,j++){data[j]=rgba[i]/255;data[area+j]=rgba[i+1]/255;data[area*2+j]=rgba[i+2]/255;}
+ return {tensor:new ort.Tensor('float32',data,[1,3,inputH,inputW]),dx,dy,scale};
+}
+function iou(a,b){const x1=Math.max(a.x1,b.x1),y1=Math.max(a.y1,b.y1),x2=Math.min(a.x2,b.x2),y2=Math.min(a.y2,b.y2);const intersection=Math.max(0,x2-x1)*Math.max(0,y2-y1);return intersection/((a.x2-a.x1)*(a.y2-a.y1)+(b.x2-b.x1)*(b.y2-b.y1)-intersection+1e-8);}
+function nms(items,limit=100){items.sort((a,b)=>b.score-a.score);const kept=[];for(const a of items){if(kept.length>=limit)break;if(kept.every(b=>a.cls!==b.cls||iou(a,b)<0.45))kept.push(a);}return kept;}
+function postprocess(output,meta){
+ const {dims,data}=output,threshold=Number($('confidence').value)/100,items=[];
+ const push=(x1,y1,x2,y2,score,cls)=>{
+  if(!Number.isFinite(score)||score<threshold||x2<=x1||y2<=y1)return;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  x1=Math.max(0,Math.min(vw,(x1-meta.dx)/meta.scale));y1=Math.max(0,Math.min(vh,(y1-meta.dy)/meta.scale));
+  x2=Math.max(0,Math.min(vw,(x2-meta.dx)/meta.scale));y2=Math.max(0,Math.min(vh,(y2-meta.dy)/meta.scale));
+  if(x2>x1&&y2>y1)items.push({x1,y1,x2,y2,score,cls});
+ };
+ if(dims.length!==3||dims[0]!==1)throw Error('不支援的輸出維度：'+dims);
+ let a=dims[1],b=dims[2];
+ // 已含 NMS 的 [1,N,6]：x1,y1,x2,y2,confidence,class
+ if(b===6&&a!==6){for(let i=0;i<a;i++){let o=i*6;push(data[o],data[o+1],data[o+2],data[o+3],data[o+4],Math.round(data[o+5]));}return nms(items);}
+ // YOLOv8/11 原始輸出 [1,4+C,N] 或 [1,N,4+C]，xywh 中心格式。
+ const channelFirst=a<b,C=channelFirst?a:b,N=channelFirst?b:a;
+ if(C<5||C>2048)throw Error('不支援的 YOLO 輸出：'+dims);
+ const at=(i,c)=>channelFirst?data[c*N+i]:data[i*C+c];
+ for(let i=0;i<N;i++){
+  let cls=0,score=-Infinity;
+  for(let c=4;c<C;c++){let v=at(i,c);if(v>score){score=v;cls=c-4;}}
+  if(score<threshold)continue;
+  const x=at(i,0),y=at(i,1),w=at(i,2),h=at(i,3);
+  push(x-w/2,y-h/2,x+w/2,y+h/2,score,cls);
+ }
+ return nms(items);
+}
+function draw(boxes){
+ ctx.clearRect(0,0,canvas.width,canvas.height);
+ ctx.save();if(mirror){ctx.translate(canvas.width,0);ctx.scale(-1,1);}
+ const stroke=Math.max(2,Math.round(canvas.width/320)),fs=Math.max(15,Math.round(canvas.width/42));
+ for(const b of boxes){const shade=color(b.cls),name=classes[b.cls]??`類別 ${b.cls}`,label=`${name} ${(b.score*100).toFixed(0)}%`;
+  ctx.strokeStyle=shade;ctx.lineWidth=stroke;ctx.strokeRect(b.x1,b.y1,b.x2-b.x1,b.y2-b.y1);
+  ctx.font=`bold ${fs}px system-ui`;const tw=ctx.measureText(label).width+10,lx=b.x1,ly=Math.max(0,b.y1-fs-9);
+  ctx.fillStyle=shade;ctx.fillRect(lx,ly,tw,fs+8);ctx.fillStyle='#04101f';ctx.fillText(label,lx+5,ly+fs+1);
+ }
+ ctx.restore();
+}
+async function loop(){
+ if(!running||busy)return;busy=true;
+ try{
+  if(video.readyState>=2){
+   const meta=preprocess(),outputs=await session.run({[session.inputNames[0]]:meta.tensor});
+   const boxes=postprocess(outputs[session.outputNames[0]],meta);draw(boxes);
+   frameCount++;const now=performance.now();if(now-lastStat>=1000){$('stats').textContent=`辨識速度：${(frameCount*1000/(now-lastStat)).toFixed(1)} FPS｜畫面物件：${boxes.length}`;frameCount=0;lastStat=now;}
+  }
+ }catch(e){console.error(e);status('推論發生錯誤：'+e.message);running=false;setButtons();}
+ finally{busy=false;if(running)requestAnimationFrame(loop);}
+}
+$('start').onclick=startCamera;$('flip').onclick=async()=>{facing=facing==='environment'?'user':'environment';await startCamera();};$('stop').onclick=stopCamera;
+$('confidence').oninput=()=>{$('threshold').textContent=$('confidence').value+'%';};window.addEventListener('pagehide',()=>{if(stream)stream.getTracks().forEach(t=>t.stop());});
+setButtons();loadModel();
+</script></body></html>
